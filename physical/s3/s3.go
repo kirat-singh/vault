@@ -34,6 +34,7 @@ var _ physical.Backend = (*S3Backend)(nil)
 // within an S3 bucket.
 type S3Backend struct {
 	bucket     string
+  prefix     string
 	kmsKeyId   string
 	client     *s3.S3
 	logger     log.Logger
@@ -51,6 +52,15 @@ func NewS3Backend(conf map[string]string, logger log.Logger) (physical.Backend, 
 			return nil, fmt.Errorf("'bucket' must be set")
 		}
 	}
+  prefix := os.Getenv("AWS_S3_PREFIX")
+  if prefix == "" {
+    if confPrefix, ok := conf["prefix"]; ok {
+      prefix = confPrefix
+    }
+  }
+  if prefix != "" && !strings.HasSuffix(prefix, "/") {
+    prefix += "/"
+  }
 
 	accessKey, ok := conf["access_key"]
 	if !ok {
@@ -119,9 +129,9 @@ func NewS3Backend(conf map[string]string, logger log.Logger) (physical.Backend, 
 		DisableSSL:       aws.Bool(disableSSLBool),
 	}))
 
-	_, err = s3conn.ListObjects(&s3.ListObjectsInput{Bucket: &bucket})
+	_, err = s3conn.ListObjects(&s3.ListObjectsInput{Bucket: &bucket, Prefix: &prefix})
 	if err != nil {
-		return nil, errwrap.Wrapf(fmt.Sprintf("unable to access bucket %q in region %q: {{err}}", bucket, region), err)
+		return nil, errwrap.Wrapf(fmt.Sprintf("unable to access bucket %q%q in region %q: {{err}}", bucket, prefix, region), err)
 	}
 
 	maxParStr, ok := conf["max_parallel"]
@@ -144,11 +154,24 @@ func NewS3Backend(conf map[string]string, logger log.Logger) (physical.Backend, 
 	s := &S3Backend{
 		client:     s3conn,
 		bucket:     bucket,
+    prefix:     prefix,
 		kmsKeyId:   kmsKeyId,
 		logger:     logger,
 		permitPool: physical.NewPermitPool(maxParInt),
 	}
 	return s, nil
+}
+
+func (s *S3Backend) makeKey(key string) (s3Key string) {
+  prefix := s.prefix
+  s3Key = key
+  if len(s.prefix) > 0 {
+    if strings.HasPrefix(s3Key, "/") {
+      prefix = prefix[:len(prefix)-1]
+    }
+    s3Key = prefix + s3Key
+  }
+  return
 }
 
 // Put is used to insert or update an entry
@@ -158,9 +181,10 @@ func (s *S3Backend) Put(ctx context.Context, entry *physical.Entry) error {
 	s.permitPool.Acquire()
 	defer s.permitPool.Release()
 
+  s3Key := s.makeKey(entry.Key)
 	putObjectInput := &s3.PutObjectInput{
 		Bucket: aws.String(s.bucket),
-		Key:    aws.String(entry.Key),
+		Key:    aws.String(s3Key),
 		Body:   bytes.NewReader(entry.Value),
 	}
 
@@ -185,9 +209,10 @@ func (s *S3Backend) Get(ctx context.Context, key string) (*physical.Entry, error
 	s.permitPool.Acquire()
 	defer s.permitPool.Release()
 
+  s3Key := s.makeKey(key)
 	resp, err := s.client.GetObject(&s3.GetObjectInput{
 		Bucket: aws.String(s.bucket),
-		Key:    aws.String(key),
+		Key:    aws.String(s3Key),
 	})
 	if resp != nil && resp.Body != nil {
 		defer resp.Body.Close()
@@ -230,9 +255,10 @@ func (s *S3Backend) Delete(ctx context.Context, key string) error {
 	s.permitPool.Acquire()
 	defer s.permitPool.Release()
 
+  s3Key := s.makeKey(key)
 	_, err := s.client.DeleteObject(&s3.DeleteObjectInput{
 		Bucket: aws.String(s.bucket),
-		Key:    aws.String(key),
+		Key:    aws.String(s3Key),
 	})
 
 	if err != nil {
@@ -250,9 +276,10 @@ func (s *S3Backend) List(ctx context.Context, prefix string) ([]string, error) {
 	s.permitPool.Acquire()
 	defer s.permitPool.Release()
 
+  s3Key := s.makeKey(prefix)
 	params := &s3.ListObjectsV2Input{
 		Bucket:    aws.String(s.bucket),
-		Prefix:    aws.String(prefix),
+		Prefix:    aws.String(s3Key),
 		Delimiter: aws.String("/"),
 	}
 
@@ -268,7 +295,7 @@ func (s *S3Backend) List(ctx context.Context, prefix string) ([]string, error) {
 						continue
 					}
 
-					commonPrefix := strings.TrimPrefix(*commonPrefix.Prefix, prefix)
+					commonPrefix := strings.TrimPrefix(*commonPrefix.Prefix, s3Key)
 					keys = append(keys, commonPrefix)
 				}
 				// Add objects only from the current 'folder'
@@ -278,7 +305,7 @@ func (s *S3Backend) List(ctx context.Context, prefix string) ([]string, error) {
 						continue
 					}
 
-					key := strings.TrimPrefix(*key.Key, prefix)
+					key := strings.TrimPrefix(*key.Key, s3Key)
 					keys = append(keys, key)
 				}
 			}
